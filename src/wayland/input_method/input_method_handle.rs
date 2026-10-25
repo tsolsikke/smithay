@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tracing::warn;
+use tracing::{debug, warn};
 use wayland_protocols_misc::zwp_input_method_v2::server::{
     zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
     zwp_input_method_v2::{self, ZwpInputMethodV2},
@@ -38,6 +38,17 @@ pub(crate) struct InputMethod {
 pub(crate) struct Instance {
     pub object: ZwpInputMethodV2,
     pub serial: u32,
+    /// The double-buffered state of `commit_string`, `set_preedit_string` and `delete_surrounding_text`,
+    /// applied on `commit` with the current serial.
+    pub pending: PendingState,
+}
+
+/// The pending state of an input method, set by its requests and applied by `commit`.
+#[derive(Debug, Default)]
+pub(crate) struct PendingState {
+    pub preedit: Option<(String, i32, i32)>,
+    pub commit_string: Option<String>,
+    pub delete_surrounding_text: Option<(u32, u32)>,
 }
 
 impl Instance {
@@ -64,6 +75,7 @@ impl InputMethodHandle {
             inner.instance = Some(Instance {
                 object: instance.clone(),
                 serial: 0,
+                pending: PendingState::default(),
             });
         }
     }
@@ -205,40 +217,58 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         match request {
+            // These requests change the pending state of the input method; `commit` applies it
+            // (input-method-unstable-v2: the state is double-buffered).
             zwp_input_method_v2::Request::CommitString { text } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.commit_string(Some(text.clone()));
-                });
+                with_pending(data, seat, |pending| pending.commit_string = Some(text));
             }
             zwp_input_method_v2::Request::SetPreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
+                with_pending(data, seat, |pending| {
+                    pending.preedit = Some((text, cursor_begin, cursor_end))
                 });
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
                 before_length,
                 after_length,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.delete_surrounding_text(before_length, after_length);
+                with_pending(data, seat, |pending| {
+                    pending.delete_surrounding_text = Some((before_length, after_length))
                 });
             }
             zwp_input_method_v2::Request::Commit { serial } => {
-                let current_serial = data
-                    .handle
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .instance
-                    .as_ref()
-                    .map(|i| i.serial)
-                    .unwrap_or(0);
-
-                data.text_input_handle.done(serial != current_serial);
+                let mut inner = data.handle.inner.lock().unwrap();
+                let Some(instance) = inner.instance.as_mut().filter(|i| &i.object == seat) else {
+                    return;
+                };
+                let pending = std::mem::take(&mut instance.pending);
+                // A commit whose serial is not the number of done events already sent was made
+                // for an older state (for example before the text input changed), so its changes
+                // must not reach the current text input.
+                if serial != instance.serial {
+                    debug!(
+                        serial,
+                        current = instance.serial,
+                        "discarding an input method commit with an old serial"
+                    );
+                    return;
+                }
+                drop(inner);
+                data.text_input_handle.with_active_text_input(|ti, _surface| {
+                    if let Some((text, cursor_begin, cursor_end)) = &pending.preedit {
+                        ti.preedit_string(Some(text.clone()), *cursor_begin, *cursor_end);
+                    }
+                    if let Some(text) = &pending.commit_string {
+                        ti.commit_string(Some(text.clone()));
+                    }
+                    if let Some((before_length, after_length)) = pending.delete_surrounding_text {
+                        ti.delete_surrounding_text(before_length, after_length);
+                    }
+                });
+                data.text_input_handle.done(false);
             }
             zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
                 if compositor::give_role(&surface, INPUT_POPUP_SURFACE_ROLE).is_err()
@@ -328,5 +358,17 @@ where
     ) {
         data.handle.inner.lock().unwrap().instance = None;
         data.text_input_handle.leave();
+    }
+}
+
+/// Changes the pending state of `input_method`, if it is the active instance of the seat.
+fn with_pending<D: SeatHandler>(
+    data: &InputMethodUserData<D>,
+    input_method: &ZwpInputMethodV2,
+    f: impl FnOnce(&mut PendingState),
+) {
+    let mut inner = data.handle.inner.lock().unwrap();
+    if let Some(instance) = inner.instance.as_mut().filter(|i| &i.object == input_method) {
+        f(&mut instance.pending);
     }
 }
