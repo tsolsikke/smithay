@@ -263,3 +263,276 @@ macro_rules! delegate_input_method_manager {
         ] => $crate::wayland::input_method::InputMethodManagerState);
     };
 }
+#[cfg(test)]
+mod tests {
+    //! These tests talk to the compositor side over a socket pair with hand-written wire messages,
+    //! so that they need no Wayland client library.
+
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::Arc,
+    };
+
+    use wayland_server::{
+        backend::{ClientData, ClientId, DisconnectReason},
+        Display,
+    };
+
+    use super::*;
+    use crate::{
+        backend::input::{KeyState, Keycode},
+        input::{
+            keyboard::{FilterResult, XkbConfig},
+            SeatState,
+        },
+        utils::SERIAL_COUNTER,
+        wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState},
+    };
+
+    struct State {
+        compositor_state: CompositorState,
+        seat_state: SeatState<Self>,
+    }
+
+    impl SeatHandler for State {
+        type KeyboardFocus = WlSurface;
+        type PointerFocus = WlSurface;
+        type TouchFocus = WlSurface;
+        fn seat_state(&mut self) -> &mut SeatState<Self> {
+            &mut self.seat_state
+        }
+    }
+
+    impl CompositorHandler for State {
+        fn compositor_state(&mut self) -> &mut CompositorState {
+            &mut self.compositor_state
+        }
+        fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+            &client.get_data::<TestClientData>().unwrap().compositor_state
+        }
+        fn commit(&mut self, _: &WlSurface) {}
+    }
+
+    impl InputMethodHandler for State {
+        fn new_popup(&mut self, _: PopupSurface) {}
+        fn dismiss_popup(&mut self, _: PopupSurface) {}
+        fn popup_repositioned(&mut self, _: PopupSurface) {}
+        fn parent_geometry(&self, _: &WlSurface) -> Rectangle<i32, Logical> {
+            Rectangle::default()
+        }
+    }
+
+    crate::delegate_compositor!(State);
+    crate::delegate_seat!(State);
+    crate::delegate_input_method_manager!(State);
+
+    #[derive(Default)]
+    struct TestClientData {
+        compositor_state: CompositorClientState,
+    }
+    impl ClientData for TestClientData {
+        fn initialized(&self, _: ClientId) {}
+        fn disconnected(&self, _: ClientId, _: DisconnectReason) {}
+    }
+
+    /// The compositor side: a display with a seat that has a keyboard, and the input method global.
+    struct Server {
+        display: Display<State>,
+        state: State,
+        seat: Seat<State>,
+    }
+
+    impl Server {
+        fn new() -> Self {
+            let display = Display::<State>::new().unwrap();
+            let dh = display.handle();
+            let mut seat_state = SeatState::new();
+            let mut seat = seat_state.new_wl_seat(&dh, "seat0");
+            seat.add_keyboard(XkbConfig::default(), 200, 25).unwrap();
+            InputMethodManagerState::new::<State, _>(&dh, |_| true);
+            let state = State {
+                compositor_state: CompositorState::new::<State>(&dh),
+                seat_state,
+            };
+            Server { display, state, seat }
+        }
+
+        fn connect(&mut self) -> RawClient {
+            let (server, client) = UnixStream::pair().unwrap();
+            self.display
+                .handle()
+                .insert_client(server, Arc::new(TestClientData::default()))
+                .unwrap();
+            client.set_nonblocking(true).unwrap();
+            let mut client = RawClient {
+                stream: client,
+                next_id: 2,
+                globals: Vec::new(),
+            };
+            // wl_display.get_registry
+            let registry = client.next_new_id();
+            client.send(1, 1, &registry.to_ne_bytes());
+            self.roundtrip();
+            for (object, opcode, body) in client.events() {
+                if (object, opcode) == (2, 0) {
+                    let name = u32::from_ne_bytes(body[0..4].try_into().unwrap());
+                    let len = u32::from_ne_bytes(body[4..8].try_into().unwrap()) as usize;
+                    let interface = String::from_utf8(body[8..8 + len - 1].to_vec()).unwrap();
+                    client.globals.push((name, interface));
+                }
+            }
+            client
+        }
+
+        fn roundtrip(&mut self) {
+            self.display.dispatch_clients(&mut self.state).unwrap();
+            self.display.flush_clients().unwrap();
+        }
+
+        /// Sends a key press from the seat's keyboard, as the backend would.
+        fn press_key(&mut self, keycode: u32) {
+            let keyboard = self.seat.get_keyboard().unwrap();
+            keyboard.input::<(), _>(
+                &mut self.state,
+                Keycode::new(keycode),
+                KeyState::Pressed,
+                SERIAL_COUNTER.next_serial(),
+                0,
+                |_, _, _| FilterResult::Forward,
+            );
+            self.display.flush_clients().unwrap();
+        }
+    }
+
+    /// A client that writes raw wire messages.
+    struct RawClient {
+        stream: UnixStream,
+        next_id: u32,
+        globals: Vec<(u32, String)>,
+    }
+
+    impl RawClient {
+        fn next_new_id(&mut self) -> u32 {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn send(&mut self, object: u32, opcode: u16, args: &[u8]) {
+            let size = (8 + args.len()) as u32;
+            let mut message = Vec::new();
+            message.extend_from_slice(&object.to_ne_bytes());
+            message.extend_from_slice(&((size << 16) | opcode as u32).to_ne_bytes());
+            message.extend_from_slice(args);
+            self.stream.write_all(&message).unwrap();
+        }
+
+        /// wl_registry.bind of the global named `interface`. Returns the new object id.
+        fn bind(&mut self, interface: &str, version: u32) -> u32 {
+            let name = self.globals.iter().find(|(_, i)| i == interface).unwrap().0;
+            let id = self.next_new_id();
+            let mut args = name.to_ne_bytes().to_vec();
+            let mut string = interface.as_bytes().to_vec();
+            string.push(0);
+            args.extend_from_slice(&(string.len() as u32).to_ne_bytes());
+            while !string.len().is_multiple_of(4) {
+                string.push(0);
+            }
+            args.extend_from_slice(&string);
+            args.extend_from_slice(&version.to_ne_bytes());
+            args.extend_from_slice(&id.to_ne_bytes());
+            self.send(2, 0, &args);
+            id
+        }
+
+        /// The events received so far, as (object, opcode, body).
+        fn events(&mut self) -> Vec<(u32, u16, Vec<u8>)> {
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match self.stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            let mut events = Vec::new();
+            let mut at = 0;
+            while at + 8 <= data.len() {
+                let object = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+                let word = u32::from_ne_bytes(data[at + 4..at + 8].try_into().unwrap());
+                let (size, opcode) = ((word >> 16) as usize, (word & 0xffff) as u16);
+                events.push((object, opcode, data[at + 8..at + size].to_vec()));
+                at += size;
+            }
+            events
+        }
+    }
+
+    /// zwp_input_method_manager_v2.get_input_method(seat, new id). Returns the input method id.
+    fn get_input_method(server: &mut Server, client: &mut RawClient, manager: u32, seat: u32) -> u32 {
+        let input_method = client.next_new_id();
+        let mut args = seat.to_ne_bytes().to_vec();
+        args.extend_from_slice(&input_method.to_ne_bytes());
+        client.send(manager, 0, &args);
+        server.roundtrip();
+        input_method
+    }
+
+    /// zwp_input_method_v2.grab_keyboard(new id). Returns the keyboard grab id.
+    fn grab_keyboard(server: &mut Server, client: &mut RawClient, input_method: u32) -> u32 {
+        let grab = client.next_new_id();
+        client.send(input_method, 5, &grab.to_ne_bytes());
+        server.roundtrip();
+        grab
+    }
+
+    /// zwp_input_method_v2.unavailable
+    const UNAVAILABLE: u16 = 6;
+    /// zwp_input_method_v2.destroy
+    const DESTROY: u16 = 6;
+    /// zwp_input_method_keyboard_grab_v2.release
+    const RELEASE: u16 = 0;
+    /// zwp_input_method_keyboard_grab_v2.key
+    const KEY: u16 = 1;
+
+    #[test]
+    fn releasing_the_grab_of_a_destroyed_input_method_keeps_the_new_grab() {
+        let mut server = Server::new();
+        let mut client = server.connect();
+        let seat = client.bind("wl_seat", 1);
+        let manager = client.bind("zwp_input_method_manager_v2", 1);
+
+        // The first input method grabs the keyboard, then destroys only its input method object.
+        let old_input_method = get_input_method(&mut server, &mut client, manager, seat);
+        let old_grab = grab_keyboard(&mut server, &mut client, old_input_method);
+        client.send(old_input_method, DESTROY, &[]);
+        server.roundtrip();
+
+        // A new input method on the same connection grabs the keyboard.
+        let input_method = get_input_method(&mut server, &mut client, manager, seat);
+        let grab = grab_keyboard(&mut server, &mut client, input_method);
+        assert!(!client
+            .events()
+            .iter()
+            .any(|&(object, opcode, _)| (object, opcode) == (input_method, UNAVAILABLE)));
+
+        // Releasing the old grab object used to release the new grab as well.
+        client.send(old_grab, RELEASE, &[]);
+        server.roundtrip();
+        assert!(
+            server.seat.get_keyboard().unwrap().is_grabbed(),
+            "the new input method lost its keyboard grab"
+        );
+        server.press_key(38);
+        assert!(
+            client
+                .events()
+                .iter()
+                .any(|&(object, opcode, _)| (object, opcode) == (grab, KEY)),
+            "the key did not reach the new input method"
+        );
+    }
+}
