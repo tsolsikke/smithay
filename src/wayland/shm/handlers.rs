@@ -190,6 +190,8 @@ where
             Request::Resize { size } => {
                 if size <= 0 {
                     pool.post_error(wl_shm::Error::InvalidFd, "invalid wl_shm_pool size");
+                    // The client is disconnected; do not touch the pool (a size of 0 would panic below).
+                    return;
                 }
 
                 if let Err(err) = arc_pool.resize(NonZeroUsize::try_from(size as usize).unwrap()) {

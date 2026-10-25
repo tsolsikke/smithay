@@ -6,6 +6,8 @@
 
 - input_method: destroying a `zwp_input_method_keyboard_grab_v2` only releases the keyboard grab when it is the
   current grab object of the seat; an older grab object no longer takes the grab away from a newer input method.
+- shm: `wl_shm_pool.resize` with a size of 0 or less no longer panics (with 0) or remaps the pool (with a negative
+  size) after posting the protocol error.
 
 ## 0.7.0
 
