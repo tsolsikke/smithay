@@ -518,3 +518,174 @@ macro_rules! delegate_shm {
         ] => $crate::wayland::shm::ShmState);
     };
 }
+
+#[cfg(test)]
+mod tests {
+    //! These tests talk to the compositor side over a socket pair with hand-written wire messages,
+    //! so that they need no Wayland client library.
+
+    use std::{
+        io::{IoSlice, Read, Write},
+        mem::MaybeUninit,
+        os::{fd::AsFd, unix::net::UnixStream},
+        sync::Arc,
+    };
+
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    use wayland_server::{
+        backend::{ClientData, ClientId, DisconnectReason},
+        protocol::wl_buffer,
+        Display,
+    };
+
+    use super::*;
+
+    struct State {
+        shm_state: ShmState,
+    }
+
+    impl BufferHandler for State {
+        fn buffer_destroyed(&mut self, _: &wl_buffer::WlBuffer) {}
+    }
+
+    impl ShmHandler for State {
+        fn shm_state(&self) -> &ShmState {
+            &self.shm_state
+        }
+    }
+
+    crate::delegate_shm!(State);
+
+    struct TestClientData;
+    impl ClientData for TestClientData {
+        fn initialized(&self, _: ClientId) {}
+        fn disconnected(&self, _: ClientId, _: DisconnectReason) {}
+    }
+
+    /// wl_display.error
+    const ERROR: u16 = 0;
+    /// wl_shm.create_pool
+    const CREATE_POOL: u16 = 0;
+    /// wl_shm_pool.resize
+    const RESIZE: u16 = 2;
+    /// wl_shm.error.invalid_fd
+    const INVALID_FD: u32 = 2;
+
+    fn message(object: u32, opcode: u16, args: &[u8]) -> Vec<u8> {
+        let size = (8 + args.len()) as u32;
+        let mut message = Vec::new();
+        message.extend_from_slice(&object.to_ne_bytes());
+        message.extend_from_slice(&((size << 16) | opcode as u32).to_ne_bytes());
+        message.extend_from_slice(args);
+        message
+    }
+
+    /// The events received so far, as (object, opcode, body).
+    fn events(stream: &mut UnixStream) -> Vec<(u32, u16, Vec<u8>)> {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => data.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut events = Vec::new();
+        let mut at = 0;
+        while at + 8 <= data.len() {
+            let object = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+            let word = u32::from_ne_bytes(data[at + 4..at + 8].try_into().unwrap());
+            let (size, opcode) = ((word >> 16) as usize, (word & 0xffff) as u16);
+            events.push((object, opcode, data[at + 8..at + size].to_vec()));
+            at += size;
+        }
+        events
+    }
+
+    /// Makes a wl_shm_pool of 4096 bytes and sends `wl_shm_pool.resize(size)`. Returns the wl_shm
+    /// error code the client received, if any, after the compositor handled the request.
+    fn resize_pool(size: i32) -> Option<u32> {
+        let mut display = Display::<State>::new().unwrap();
+        let mut dh = display.handle();
+        let shm_state = ShmState::new::<State>(&dh, []);
+        let shm_name = shm_state.global();
+        let mut state = State { shm_state };
+        let (server, mut client) = UnixStream::pair().unwrap();
+        dh.insert_client(server, Arc::new(TestClientData)).unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        // wl_display.get_registry, then wl_registry.bind of wl_shm (the only global).
+        client.write_all(&message(1, 1, &2u32.to_ne_bytes())).unwrap();
+        display.dispatch_clients(&mut state).unwrap();
+        display.flush_clients().unwrap();
+        let name = events(&mut client)
+            .into_iter()
+            .find(|&(object, opcode, _)| (object, opcode) == (2, 0))
+            .map(|(_, _, body)| u32::from_ne_bytes(body[0..4].try_into().unwrap()))
+            .unwrap();
+        assert_eq!(
+            dh.backend_handle().global_info(shm_name).unwrap().interface.name,
+            "wl_shm"
+        );
+        let mut args = name.to_ne_bytes().to_vec();
+        args.extend_from_slice(&7u32.to_ne_bytes());
+        args.extend_from_slice(b"wl_shm\0\0");
+        args.extend_from_slice(&1u32.to_ne_bytes());
+        args.extend_from_slice(&3u32.to_ne_bytes());
+        client.write_all(&message(2, 0, &args)).unwrap();
+
+        // wl_shm.create_pool(new id 4, fd, 4096), with the fd of a memfd.
+        let memfd = rustix::fs::memfd_create("smithay-test", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&memfd, 4096).unwrap();
+        let create = message(
+            3,
+            CREATE_POOL,
+            &[4u32.to_ne_bytes(), 4096i32.to_ne_bytes()].concat(),
+        );
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        let fds = [memfd.as_fd()];
+        assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
+        rustix::net::sendmsg(
+            &client,
+            &[IoSlice::new(&create)],
+            &mut control,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        display.dispatch_clients(&mut state).unwrap();
+        display.flush_clients().unwrap();
+        // The pool is made: no error so far (wl_shm sends its formats).
+        assert!(!events(&mut client)
+            .iter()
+            .any(|&(object, opcode, _)| (object, opcode) == (1, ERROR)));
+
+        // wl_shm_pool.resize(size)
+        client
+            .write_all(&message(4, RESIZE, &size.to_ne_bytes()))
+            .unwrap();
+        display.dispatch_clients(&mut state).unwrap();
+        display.flush_clients().unwrap();
+        events(&mut client)
+            .into_iter()
+            .find(|&(object, opcode, _)| (object, opcode) == (1, ERROR))
+            .map(|(_, _, body)| u32::from_ne_bytes(body[4..8].try_into().unwrap()))
+    }
+
+    #[test]
+    fn resizing_a_pool_to_zero_is_a_protocol_error() {
+        assert_eq!(resize_pool(0), Some(INVALID_FD));
+    }
+
+    #[test]
+    fn resizing_a_pool_to_a_negative_size_is_a_protocol_error() {
+        assert_eq!(resize_pool(-1), Some(INVALID_FD));
+    }
+
+    #[test]
+    fn a_pool_can_grow() {
+        assert_eq!(resize_pool(8192), None);
+    }
+}
