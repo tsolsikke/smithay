@@ -136,7 +136,11 @@ impl InputMethodHandle {
     /// Activate input method on the given surface.
     pub(crate) fn activate_input_method<D: SeatHandler + 'static>(&self, state: &mut D, surface: &WlSurface) {
         self.with_input_method(|im| {
-            if let Some(instance) = im.instance.as_ref() {
+            if let Some(instance) = im.instance.as_mut() {
+                // The activate event resets the state of set_preedit_string, commit_string and
+                // delete_surrounding_text: requests made for the previous text input must not
+                // reach this one with a later commit.
+                instance.pending = PendingState::default();
                 instance.object.activate();
                 if let Some(popup) = im.popup_handle.surface.as_mut() {
                     let data = instance.object.data::<InputMethodUserData<D>>().unwrap();

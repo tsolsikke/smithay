@@ -11,7 +11,8 @@
 - input_method: `commit_string`, `set_preedit_string` and `delete_surrounding_text` are double-buffered and only sent
   to the text input on a `commit` whose serial is the number of done events sent to the input method; a commit made
   for an older state (for example before the focused text input changed) is discarded instead of reaching the new
-  text input.
+  text input. The pending state is reset when the input method is activated, so requests made before the activate
+  event are not applied by a later commit.
 
 ## 0.7.0
 
