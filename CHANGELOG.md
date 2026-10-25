@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Bugfixes
+
+- input_method: destroying a `zwp_input_method_keyboard_grab_v2` only releases the keyboard grab when it is the
+  current grab object of the seat; an older grab object no longer takes the grab away from a newer input method.
+
 ## 0.7.0
 
 ### Breaking changes
