@@ -293,6 +293,8 @@ mod tests {
     struct State {
         compositor_state: CompositorState,
         seat_state: SeatState<Self>,
+        /// The last committed surface (to give it the keyboard focus).
+        last_surface: Option<WlSurface>,
     }
 
     impl SeatHandler for State {
@@ -311,7 +313,9 @@ mod tests {
         fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
             &client.get_data::<TestClientData>().unwrap().compositor_state
         }
-        fn commit(&mut self, _: &WlSurface) {}
+        fn commit(&mut self, surface: &WlSurface) {
+            self.last_surface = Some(surface.clone());
+        }
     }
 
     impl InputMethodHandler for State {
@@ -326,6 +330,7 @@ mod tests {
     crate::delegate_compositor!(State);
     crate::delegate_seat!(State);
     crate::delegate_input_method_manager!(State);
+    crate::delegate_text_input_manager!(State);
 
     #[derive(Default)]
     struct TestClientData {
@@ -351,9 +356,11 @@ mod tests {
             let mut seat = seat_state.new_wl_seat(&dh, "seat0");
             seat.add_keyboard(XkbConfig::default(), 200, 25).unwrap();
             InputMethodManagerState::new::<State, _>(&dh, |_| true);
+            crate::wayland::text_input::TextInputManagerState::new::<State>(&dh);
             let state = State {
                 compositor_state: CompositorState::new::<State>(&dh),
                 seat_state,
+                last_surface: None,
             };
             Server { display, state, seat }
         }
@@ -533,6 +540,97 @@ mod tests {
                 .iter()
                 .any(|&(object, opcode, _)| (object, opcode) == (grab, KEY)),
             "the key did not reach the new input method"
+        );
+    }
+
+    /// zwp_input_method_v2.set_preedit_string(text, cursor_begin, cursor_end)
+    const SET_PREEDIT_STRING: u16 = 1;
+    /// zwp_input_method_v2.commit(serial)
+    const COMMIT: u16 = 3;
+    /// zwp_input_method_v2.done
+    const INPUT_METHOD_DONE: u16 = 5;
+    /// zwp_text_input_v3.enable / commit (requests) and preedit_string / done (events)
+    const TEXT_INPUT_ENABLE: u16 = 1;
+    const TEXT_INPUT_COMMIT: u16 = 7;
+    const TEXT_INPUT_PREEDIT_STRING: u16 = 2;
+    const TEXT_INPUT_DONE: u16 = 5;
+
+    fn string_arg(text: &str) -> Vec<u8> {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        let mut args = (bytes.len() as u32).to_ne_bytes().to_vec();
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        args.extend_from_slice(&bytes);
+        args
+    }
+
+    fn set_preedit_and_commit(
+        server: &mut Server,
+        client: &mut RawClient,
+        input_method: u32,
+        text: &str,
+        serial: u32,
+    ) {
+        let mut args = string_arg(text);
+        args.extend_from_slice(&1i32.to_ne_bytes());
+        args.extend_from_slice(&1i32.to_ne_bytes());
+        client.send(input_method, SET_PREEDIT_STRING, &args);
+        client.send(input_method, COMMIT, &serial.to_ne_bytes());
+        server.roundtrip();
+    }
+
+    #[test]
+    fn a_commit_with_an_old_serial_does_not_reach_the_text_input() {
+        let mut server = Server::new();
+        let mut client = server.connect();
+        let compositor = client.bind("wl_compositor", 1);
+        let seat = client.bind("wl_seat", 1);
+        let manager = client.bind("zwp_input_method_manager_v2", 1);
+        let text_input_manager = client.bind("zwp_text_input_manager_v3", 1);
+        let input_method = get_input_method(&mut server, &mut client, manager, seat);
+
+        // A text input on a surface with the keyboard focus, enabled by the application.
+        let text_input = client.next_new_id();
+        let mut args = text_input.to_ne_bytes().to_vec();
+        args.extend_from_slice(&seat.to_ne_bytes());
+        client.send(text_input_manager, 1, &args);
+        let surface = client.next_new_id();
+        client.send(compositor, 0, &surface.to_ne_bytes());
+        client.send(surface, 6, &[]);
+        server.roundtrip();
+        let focus = server.state.last_surface.clone().unwrap();
+        let keyboard = server.seat.get_keyboard().unwrap();
+        keyboard.set_focus(&mut server.state, Some(focus), SERIAL_COUNTER.next_serial());
+        server.roundtrip();
+        client.send(text_input, TEXT_INPUT_ENABLE, &[]);
+        client.send(text_input, TEXT_INPUT_COMMIT, &[]);
+        server.roundtrip();
+        // The serial of a commit is the number of done events the input method got so far.
+        let dones = client
+            .events()
+            .iter()
+            .filter(|&&(object, opcode, _)| (object, opcode) == (input_method, INPUT_METHOD_DONE))
+            .count() as u32;
+        assert!(dones > 0);
+
+        // A commit with the current serial reaches the text input.
+        set_preedit_and_commit(&mut server, &mut client, input_method, "a", dones);
+        let events = client.events();
+        assert!(events
+            .iter()
+            .any(|&(object, opcode, _)| (object, opcode) == (text_input, TEXT_INPUT_PREEDIT_STRING)));
+        assert!(events
+            .iter()
+            .any(|&(object, opcode, _)| (object, opcode) == (text_input, TEXT_INPUT_DONE)));
+
+        // A commit with an older serial is discarded: nothing reaches the text input.
+        set_preedit_and_commit(&mut server, &mut client, input_method, "b", dones - 1);
+        let events = client.events();
+        assert!(
+            !events.iter().any(|&(object, _, _)| object == text_input),
+            "{events:?}"
         );
     }
 }
