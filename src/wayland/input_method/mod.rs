@@ -547,10 +547,12 @@ mod tests {
     const SET_PREEDIT_STRING: u16 = 1;
     /// zwp_input_method_v2.commit(serial)
     const COMMIT: u16 = 3;
-    /// zwp_input_method_v2.done
+    /// zwp_input_method_v2.activate / done
+    const INPUT_METHOD_ACTIVATE: u16 = 0;
     const INPUT_METHOD_DONE: u16 = 5;
-    /// zwp_text_input_v3.enable / commit (requests) and preedit_string / done (events)
+    /// zwp_text_input_v3.enable / disable / commit (requests) and preedit_string / done (events)
     const TEXT_INPUT_ENABLE: u16 = 1;
+    const TEXT_INPUT_DISABLE: u16 = 2;
     const TEXT_INPUT_COMMIT: u16 = 7;
     const TEXT_INPUT_PREEDIT_STRING: u16 = 2;
     const TEXT_INPUT_DONE: u16 = 5;
@@ -581,17 +583,24 @@ mod tests {
         server.roundtrip();
     }
 
-    #[test]
-    fn a_commit_with_an_old_serial_does_not_reach_the_text_input() {
-        let mut server = Server::new();
-        let mut client = server.connect();
+    /// The number of done events among `events` sent to `input_method`.
+    fn count_dones(events: &[(u32, u16, Vec<u8>)], input_method: u32) -> u32 {
+        events
+            .iter()
+            .filter(|&&(object, opcode, _)| (object, opcode) == (input_method, INPUT_METHOD_DONE))
+            .count() as u32
+    }
+
+    /// An input method and a text input on a surface with the keyboard focus, enabled by the
+    /// application. Returns the input method, the text input and the number of done events the
+    /// input method got so far (the serial of its next commit).
+    fn an_active_input_method(server: &mut Server, client: &mut RawClient) -> (u32, u32, u32) {
         let compositor = client.bind("wl_compositor", 1);
         let seat = client.bind("wl_seat", 1);
         let manager = client.bind("zwp_input_method_manager_v2", 1);
         let text_input_manager = client.bind("zwp_text_input_manager_v3", 1);
-        let input_method = get_input_method(&mut server, &mut client, manager, seat);
+        let input_method = get_input_method(server, client, manager, seat);
 
-        // A text input on a surface with the keyboard focus, enabled by the application.
         let text_input = client.next_new_id();
         let mut args = text_input.to_ne_bytes().to_vec();
         args.extend_from_slice(&seat.to_ne_bytes());
@@ -607,13 +616,16 @@ mod tests {
         client.send(text_input, TEXT_INPUT_ENABLE, &[]);
         client.send(text_input, TEXT_INPUT_COMMIT, &[]);
         server.roundtrip();
-        // The serial of a commit is the number of done events the input method got so far.
-        let dones = client
-            .events()
-            .iter()
-            .filter(|&&(object, opcode, _)| (object, opcode) == (input_method, INPUT_METHOD_DONE))
-            .count() as u32;
+        let dones = count_dones(&client.events(), input_method);
         assert!(dones > 0);
+        (input_method, text_input, dones)
+    }
+
+    #[test]
+    fn a_commit_with_an_old_serial_does_not_reach_the_text_input() {
+        let mut server = Server::new();
+        let mut client = server.connect();
+        let (input_method, text_input, dones) = an_active_input_method(&mut server, &mut client);
 
         // A commit with the current serial reaches the text input.
         set_preedit_and_commit(&mut server, &mut client, input_method, "a", dones);
@@ -632,5 +644,42 @@ mod tests {
             !events.iter().any(|&(object, _, _)| object == text_input),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn a_preedit_set_before_the_activate_is_not_applied_by_a_later_commit() {
+        let mut server = Server::new();
+        let mut client = server.connect();
+        let (input_method, text_input, mut dones) = an_active_input_method(&mut server, &mut client);
+
+        // A preedit without a commit, then the application disables and enables the text input
+        // again (deactivate and activate, each with a done).
+        let mut args = string_arg("a");
+        args.extend_from_slice(&1i32.to_ne_bytes());
+        args.extend_from_slice(&1i32.to_ne_bytes());
+        client.send(input_method, SET_PREEDIT_STRING, &args);
+        server.roundtrip();
+        client.send(text_input, TEXT_INPUT_DISABLE, &[]);
+        client.send(text_input, TEXT_INPUT_COMMIT, &[]);
+        client.send(text_input, TEXT_INPUT_ENABLE, &[]);
+        client.send(text_input, TEXT_INPUT_COMMIT, &[]);
+        server.roundtrip();
+        let events = client.events();
+        assert!(events
+            .iter()
+            .any(|&(object, opcode, _)| (object, opcode) == (input_method, INPUT_METHOD_ACTIVATE)));
+        dones += count_dones(&events, input_method);
+
+        // The activate reset the preedit: a commit with the current serial reaches the text
+        // input with done only.
+        client.send(input_method, COMMIT, &dones.to_ne_bytes());
+        server.roundtrip();
+        let events = client.events();
+        let text_input_events: Vec<u16> = events
+            .iter()
+            .filter(|&&(object, _, _)| object == text_input)
+            .map(|&(_, opcode, _)| opcode)
+            .collect();
+        assert_eq!(text_input_events, [TEXT_INPUT_DONE], "{events:?}");
     }
 }
